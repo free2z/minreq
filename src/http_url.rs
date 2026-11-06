@@ -6,11 +6,11 @@ use crate::Error;
 pub(crate) enum Port {
     ImplicitHttp,
     ImplicitHttps,
-    Explicit(u32),
+    Explicit(u16),
 }
 
 impl Port {
-    pub(crate) fn port(self) -> u32 {
+    pub(crate) fn port(self) -> u16 {
         match self {
             Port::ImplicitHttp => 80,
             Port::ImplicitHttps => 443,
@@ -73,10 +73,18 @@ impl HttpUrl {
                             resource.push(c);
                         }
                         ':' => status = UrlParseStatus::Port,
+                        '#' => {
+                            status = UrlParseStatus::Fragment;
+                            path_and_query = Some(String::new());
+                        }
                         _ => host.push(c),
                     }
                 }
                 UrlParseStatus::Port => match c {
+                    '#' => {
+                        status = UrlParseStatus::Fragment;
+                        path_and_query = Some(String::new());
+                    }
                     '/' | '?' => {
                         status = UrlParseStatus::PathAndQuery;
                         resource.push(c);
@@ -151,13 +159,24 @@ impl HttpUrl {
         }
 
         // Set appropriate port
-        let port = port.parse::<u32>().map(Port::Explicit).unwrap_or_else(|_| {
+        let port = if port.is_empty() {
             if https {
                 Port::ImplicitHttps
             } else {
                 Port::ImplicitHttp
             }
-        });
+        } else {
+            let invalid_port = || {
+                Error::IoError(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid URL port",
+                ))
+            };
+            if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid_port());
+            }
+            Port::Explicit(port.parse::<u16>().map_err(|_| invalid_port())?)
+        };
 
         Ok(HttpUrl {
             https,
@@ -201,5 +220,59 @@ fn to_hex_digit(digit: u8) -> char {
     match digit {
         0..=9 => (b'0' + digit) as char,
         10..=255 => (b'A' - 10 + digit) as char,
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+
+    #[test]
+    fn port_boundaries_and_defaults() {
+        for (url, expected) in [
+            ("http://example.test/", 80),
+            ("https://example.test/", 443),
+            ("https://example.test:/", 443),
+            ("http://example.test:0/", 0),
+            ("http://example.test:65535/", 65535),
+            ("http://example.test:00080/", 80),
+        ] {
+            assert_eq!(HttpUrl::parse(url, None).unwrap().port.port(), expected);
+        }
+    }
+
+    #[test]
+    fn authority_fragments_preserve_valid_ports() {
+        for (url, port) in [
+            ("http://example.test#section", 80),
+            ("http://example.test:80#section", 80),
+            ("https://example.test:65535#section", 65535),
+            ("https://example.test:#section", 443),
+        ] {
+            let parsed = HttpUrl::parse(url, None).unwrap();
+            assert_eq!(parsed.port.port(), port);
+            assert_eq!(parsed.path_and_query, "/");
+            assert_eq!(parsed.fragment.as_deref(), Some("section"));
+        }
+        assert!(HttpUrl::parse("http://example.test:65536#section", None).is_err());
+    }
+
+    #[test]
+    fn invalid_explicit_ports_are_rejected() {
+        for port in [
+            "65536",
+            "65616",
+            "4294967295",
+            "4294967296",
+            "-1",
+            "+80",
+            "abc",
+        ] {
+            let url = format!("http://example.test:{port}/");
+            assert!(matches!(
+                HttpUrl::parse(&url, None),
+                Err(Error::IoError(error)) if error.kind() == std::io::ErrorKind::InvalidInput
+            ));
+        }
     }
 }

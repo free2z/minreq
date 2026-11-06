@@ -340,24 +340,18 @@ impl ParsedRequest {
                 if let Ok(proxy) =
                     std::env::var("https_proxy").map_err(|_| std::env::var("HTTPS_PROXY"))
                 {
-                    if let Ok(proxy) = Proxy::new(proxy) {
-                        config.proxy = Some(proxy);
-                    }
+                    config.proxy = Some(Proxy::new(proxy)?);
                 }
             }
             // Set HTTP proxies if request's protocol is HTTP and they're given
             else if let Ok(proxy) = std::env::var("http_proxy") {
-                if let Ok(proxy) = Proxy::new(proxy) {
-                    config.proxy = Some(proxy);
-                }
+                config.proxy = Some(Proxy::new(proxy)?);
             }
             // Set any given proxies if neither of HTTP/HTTPS were given
             else if let Ok(proxy) =
                 std::env::var("all_proxy").map_err(|_| std::env::var("ALL_PROXY"))
             {
-                if let Ok(proxy) = Proxy::new(proxy) {
-                    config.proxy = Some(proxy);
-                }
+                config.proxy = Some(Proxy::new(proxy)?);
             }
         }
 
@@ -592,5 +586,71 @@ mod encoding_tests {
             &req.url.path_and_query,
             "/?%C3%B3w%C3%B2=what%27s%20this?%20%F0%9F%91%80"
         );
+    }
+}
+
+#[cfg(all(test, feature = "proxy"))]
+mod environment_proxy_tests {
+    use super::{get, ParsedRequest};
+    use crate::{Error, Proxy};
+
+    #[test]
+    fn configured_environment_proxy_is_validated() {
+        const CASE: &str = "MINREQ_PROXY_TEST_CASE";
+        if let Ok(case) = std::env::var(CASE) {
+            let mut request = get(if case.starts_with("https") {
+                "https://example.test/"
+            } else {
+                "http://example.test/"
+            });
+            if case == "explicit" {
+                request = request.with_proxy(Proxy::new("gateway:1234").unwrap());
+            }
+            if case.ends_with("invalid") {
+                assert!(matches!(request.send(), Err(Error::BadProxy)));
+            } else {
+                let parsed = ParsedRequest::new(request).unwrap();
+                assert_eq!(parsed.config.proxy.unwrap().port, 1234);
+            }
+            return;
+        }
+
+        for (case, variable, value) in [
+            ("http-invalid", "http_proxy", "gateway:65536"),
+            ("http-invalid", "all_proxy", "gateway:65536"),
+            ("https-invalid", "https_proxy", "gateway:65536"),
+            ("http-invalid", "http_proxy", "gateway:+8080"),
+            ("http", "http_proxy", "gateway:1234"),
+            ("http", "all_proxy", "gateway:1234"),
+            ("https", "https_proxy", "gateway:1234"),
+            ("explicit", "http_proxy", "gateway:65536"),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "request::environment_proxy_tests::configured_environment_proxy_is_validated",
+            ]);
+            for key in [
+                "http_proxy",
+                "HTTP_PROXY",
+                "https_proxy",
+                "HTTPS_PROXY",
+                "all_proxy",
+                "ALL_PROXY",
+            ] {
+                command.env_remove(key);
+            }
+            let output = command
+                .env(CASE, case)
+                .env(variable, value)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}/{variable}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
